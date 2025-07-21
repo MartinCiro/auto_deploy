@@ -3,7 +3,7 @@
 # --- Configuración para softcalfut ---
 AWS_REGION="us-east-1"
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-ECR_REPOSITORY_NAME="softcalfut-front"
+ECR_REPOSITORY_NAME="proyecto_softcalfut_softcalfut_front"
 IMAGE_NAME="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY_NAME}"
 #907020542361.dkr.ecr.us-east-1.amazonaws.com/softcalfutFront/
 # Configuración de Docker Compose
