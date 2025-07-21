@@ -1,5 +1,8 @@
 services:
   app:
-    image: 907020542361.dkr.ecr.us-east-1.amazonaws.com/image_name/id_xx:latest
-    container_name: service_name_test
-    restart: always
+    build:
+      context: .
+      dockerfile: dockerfile
+      args:
+        - VERSION=${VERSION}
+    image: ${DOCKER_IMAGE_NAME}

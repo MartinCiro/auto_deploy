@@ -2,13 +2,13 @@
 
 # --- Configuration ---
 DIR_ROOT="/home/ciro_admin/git/personal/auto_deploy"
-REPO_DIR="${DIR_ROOT}/softcalfutFront"
-REPO_GIT="github.com/MartinCiro/softcalfutFront"
+REPO_DIR="${DIR_ROOT}/proyecto_softcalfut"
+REPO_GIT="github.com/MartinCiro/proyecto_softcalfut"
+
 REPO_URL="git@${REPO_GIT}"
 
-
 # Docker and AWS Configuration
-ID="softcalfut-front"
+ID="proyecto_softcalfut"
 REGION="us-east-1"
 USER=$(aws sts get-caller-identity --query Account --output text)
 DOCKER="docker"
@@ -67,11 +67,11 @@ check_repo() {
     # Verificar y clonar repositorio si no existe
     if [ ! -d "$REPO_DIR/.git" ]; then
         log_message "Cloning repository for the first time..."
-        git clone "$REPO_URL" "$REPO_DIR" || {
+        git clone --recurse-submodules "$REPO_URL" "$REPO_DIR" || {
             log_message "ERROR: Failed to clone repository"
             return 1
         }
-        # Retornar éxito para forzar build inicial
+        cd "$REPO_DIR" && git submodule update --init --recursive
         return 0
     fi
 
@@ -79,9 +79,19 @@ check_repo() {
         log_message "ERROR: Failed to enter repository directory"
         return 1
     }
+    git config --global --add safe.directory "$REPO_DIR"
+
+    git fetch origin
+    git pull origin "$current_branch" || {
+        log_message "WARNING: git pull failed"
+        return 1
+    }
+
+    # Actualizar submódulos
+    git submodule sync --recursive
+    git submodule update --init --recursive
 
     # Configurar safe.directory para evitar problemas de permisos
-    git config --global --add safe.directory "$REPO_DIR"
 
     # Obtener commit actual ANTES del pull
     local current_commit=$(git rev-parse HEAD)
@@ -108,49 +118,54 @@ check_repo() {
 }
 
 build_and_push_docker() {
-    # Obtener y validar configuración
     local new_version=$(increment_version $(get_current_version))
     local image_version="${DOCKER_IMAGE_NAME}:${new_version}"
     local image_latest="${DOCKER_IMAGE_NAME}:latest"
 
-    log_message "Iniciando construcción Docker para versión $new_version..."
-    
-    # Validar Dockerfile
-    if [ ! -f "$DOCKERFILE_PATH" ]; then
-        log_message "ERROR: Dockerfile no encontrado en $DOCKERFILE_PATH"
+    log_message "Iniciando construcción Docker Compose para versión $new_version..."
+
+    if [ ! -f "$REPO_DIR/docker-compose.yml" ]; then
+        log_message "ERROR: docker-compose.yml no encontrado en $REPO_DIR"
         return 1
     fi
 
-    # Limpieza de imágenes antiguas (conservando espacio en disco)
+    # Limpiar imágenes antiguas
     log_message "Limpiando imágenes antiguas..."
     $DOCKER system prune -af --filter "until=24h" || {
         log_message "WARNING: No se pudo limpiar completamente"
     }
 
-    # Construir imagen con versión específica
-    log_message "Construyendo imagen Docker..."
-    if ! $DOCKER build \
-        -t "$image_version" \
-        -t "$image_latest" \
-        -f "$DOCKERFILE_PATH" \
-        --build-arg VERSION="$new_version" \
-        .; then
-        log_message "ERROR: Falló la construcción de Docker"
+    # Crear archivo .env para docker-compose (si no lo usas aún)
+    echo "VERSION=$new_version" > "$REPO_DIR/.env"
+    echo "DOCKER_IMAGE_NAME=$DOCKER_IMAGE_NAME" >> "$REPO_DIR/.env"
+
+    # Construir con docker-compose
+    log_message "Ejecutando docker-compose build..."
+    if ! docker-compose -f "$REPO_DIR/docker-compose.yml" --env-file "$REPO_DIR/.env" build; then
+        log_message "ERROR: Falló la construcción con docker-compose"
         return 1
     fi
 
-    # Autenticación con ECR (con reintento)
+    # Verificar si la imagen fue creada
+    if ! $DOCKER image inspect "$DOCKER_IMAGE_NAME" >/dev/null 2>&1; then
+        log_message "ERROR: No se encontró una imagen local llamada $DOCKER_IMAGE_NAME"
+        return 1
+    fi
+
+    # Etiquetar imagen con versión
+    log_message "Etiquetando imágenes..."
+    $DOCKER tag "$DOCKER_IMAGE_NAME" "$image_version"
+    $DOCKER tag "$DOCKER_IMAGE_NAME" "$image_latest"
+
+    # Login a ECR
     log_message "Autenticando con ECR..."
     if ! aws ecr get-login-password --region "$REGION" | \
         $DOCKER login --username AWS --password-stdin "$ECR_URL"; then
-        log_message "ERROR: Falló autenticación con ECR. Verifica:"
-        log_message "1. AWS CLI configurado (aws configure)"
-        log_message "2. Permisos IAM para ECR"
-        log_message "3. Red/Conectividad"
+        log_message "ERROR: Falló autenticación con ECR"
         return 1
     fi
 
-    # Push de imágenes (con manejo de errores robusto)
+    # Subir imágenes
     log_message "Subiendo imágenes a ECR..."
     if ! $DOCKER push "$image_version"; then
         log_message "ERROR: Falló push de versión $new_version"
@@ -162,13 +177,9 @@ build_and_push_docker() {
         return 1
     fi
 
-    # Actualizar versión y registrar éxito
     echo "$new_version" > "$VERSION_FILE"
-    log_message "✅ Despliegue exitoso! Versión $new_version en ECR"
-    
-    # Opcional: Notificar a sistemas externos
-    # notify_slack "Nueva versión $new_version desplegada"
-    
+    log_message "✅ Despliegue exitoso con Docker Compose! Versión $new_version en ECR"
+
     return 0
 }
 
