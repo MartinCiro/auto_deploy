@@ -1,17 +1,18 @@
 #!/bin/bash
+DOCKER_PRUNE_DAYS=1
 
 # --- Configuración para softcalfut ---
 AWS_REGION="us-east-1"
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-ECR_REPOSITORY_NAME="proyecto_softcalfut_softcalfut_front"
-IMAGE_NAME="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY_NAME}"
-#907020542361.dkr.ecr.us-east-1.amazonaws.com/softcalfutFront/
+
+# Lista de servicios
+declare -a SERVICES=("softcalfut_front" "softcalfut_back")
+
 # Configuración de Docker Compose
-DOCKER_COMPOSE_FILE="/home/ciro_admin/git/personal/auto_deploy/docker-compose.yml"  # Ajusta esta ruta
-DOCKER_COMPOSE_SERVICE_NAME="app"  # Nombre del servicio en tu compose
+DOCKER_COMPOSE_FILE="$HOME/git/personal/auto_deploy/proyecto_softcalfut/docker-compose.yml"
 
 # Directorio de logs
-LOG_DIR="/home/ciro_admin/git/personal/auto_deploy/softcalfutFront/logs"
+LOG_DIR="$HOME/git/personal/auto_deploy/logs"
 mkdir -p ${LOG_DIR}
 LOG_FILE="${LOG_DIR}/ecr_monitor_$(date +%Y-%m-%d).log"
 LOCK_FILE="${LOG_DIR}/ecr_monitor.lock"
@@ -44,44 +45,79 @@ docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REG
     exit 1
 }
 
-# --- Obtener última imagen en ECR ---
-log "Buscando última imagen en ECR..."
-ECR_DIGEST=$(aws ecr describe-images \
-    --repository-name ${ECR_REPOSITORY_NAME} \
-    --image-ids imageTag=latest \
-    --region ${AWS_REGION} \
-    --query 'imageDetails[0].imageDigest' \
-    --output text 2>/dev/null)
+# --- Iterar sobre servicios ---
+for SERVICE in "${SERVICES[@]}"; do
+    ECR_REPOSITORY_NAME="proyecto_softcalfut_${SERVICE}"
+    IMAGE_NAME="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY_NAME}"
+    VERSION_FILE="$HOME/git/personal/auto_deploy/version_${SERVICE}.txt"
+    CURRENT_VERSION=$(cat ${VERSION_FILE} 2>/dev/null || echo "${DOCKER_IMAGE_VERSION}" || echo "1.0.0")
+    export VERSION="${CURRENT_VERSION}"
 
-    
-if [ -z "$ECR_DIGEST" ]; then
-    log "WARNING: No se encontró imagen 'latest' en ECR"
-    exit 0
-fi
+    # --- Obtener última imagen en ECR por versión específica ---
 
-# --- Obtener imagen local ---
-log "Verificando imagen local..."
-LOCAL_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${IMAGE_NAME}:latest 2>/dev/null | cut -d'@' -f2)
+    ECR_DIGEST=$(aws ecr describe-images \
+        --repository-name ${ECR_REPOSITORY_NAME} \
+        --image-ids imageTag=${CURRENT_VERSION} \
+        --region ${AWS_REGION} \
+        --query 'imageDetails[0].imageDigest' \
+        --output text 2>/dev/null)
 
-if [ -z "$LOCAL_DIGEST" ]; then
-    log "WARNING: No se encontró imagen local, forzando pull..."
-    docker-compose -f "${DOCKER_COMPOSE_FILE}" pull "${DOCKER_COMPOSE_SERVICE_NAME}"
-    LOCAL_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${IMAGE_NAME}:latest 2>/dev/null | cut -d'@' -f2)
-fi
+    if [ -z "$ECR_DIGEST" ]; then
+        ECR_DIGEST=$(aws ecr describe-images \
+            --repository-name ${ECR_REPOSITORY_NAME} \
+            --image-ids imageTag=latest \
+            --region ${AWS_REGION} \
+            --query 'imageDetails[0].imageDigest' \
+            --output text 2>/dev/null)
 
-# --- Comparación y actualización ---
-if [ "$ECR_DIGEST" != "$LOCAL_DIGEST" ]; then
-    log "NUEVA VERSIÓN DETECTADA:"
-    log "  ECR:    ${ECR_DIGEST}"
-    log "  Local:  ${LOCAL_DIGEST}"
-    
-    log "Actualizando contenedor..."
-    docker-compose -f "${DOCKER_COMPOSE_FILE}" pull "${DOCKER_COMPOSE_SERVICE_NAME}" && \
-    docker-compose -f "${DOCKER_COMPOSE_FILE}" up -d --no-deps "${DOCKER_COMPOSE_SERVICE_NAME}" && \
-    log "Contenedor actualizado correctamente" || \
-    log "ERROR: Fallo al actualizar el contenedor"
-else
-    log "No hay cambios (Digest: ${ECR_DIGEST})"
-fi
+        if [ -z "$ECR_DIGEST" ]; then
+            log "ERROR: No se encontró imagen en ECR (ni versión ni latest) para ${SERVICE}"
+            continue
+        fi
+    fi
+
+    # --- Obtener imagen local ---
+    log "Verificando imagen local..."
+    LOCAL_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${IMAGE_NAME}:${CURRENT_VERSION} 2>/dev/null | cut -d'@' -f2)
+
+    if [ -z "$LOCAL_DIGEST" ]; then
+        LOCAL_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${IMAGE_NAME}:latest 2>/dev/null | cut -d'@' -f2)
+
+        if [ -z "$LOCAL_DIGEST" ]; then
+            log "WARNING: No se encontró imagen local, forzando pull para ${SERVICE}..."
+            docker-compose -f "${DOCKER_COMPOSE_FILE}" pull "${SERVICE}"
+            LOCAL_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${IMAGE_NAME}:latest 2>/dev/null | cut -d'@' -f2)
+        fi
+    fi
+
+    # --- Comparación y actualización ---
+    if [ "$ECR_DIGEST" != "$LOCAL_DIGEST" ]; then
+        docker-compose -f "${DOCKER_COMPOSE_FILE}" stop "${SERVICE}" || true
+        docker-compose -f "${DOCKER_COMPOSE_FILE}" rm -f "${SERVICE}" || true
+
+        log "Limpiando recursos antiguos..."
+        docker system prune -af --filter "until=${DOCKER_PRUNE_DAYS}d" || true
+
+        log "Actualizando contenedor..."
+        if ! docker-compose -f "${DOCKER_COMPOSE_FILE}" pull "${SERVICE}" --ignore-pull-failures; then
+            log "WARNING: Fallo al pull con versión específica, intentando con latest..."
+            IMAGE_TAG_ORIGINAL=$(grep -A1 "${SERVICE}:" "${DOCKER_COMPOSE_FILE}" | grep 'image:' | awk '{print $2}' | cut -d':' -f2)
+            sed -i "/${SERVICE}:/,/image:/ s|image:.*|image: ${IMAGE_NAME}:latest|" "${DOCKER_COMPOSE_FILE}"
+            docker-compose -f "${DOCKER_COMPOSE_FILE}" pull "${SERVICE}"
+            sed -i "/${SERVICE}:/,/image:/ s|image:.*|image: ${IMAGE_NAME}:${IMAGE_TAG_ORIGINAL}|" "${DOCKER_COMPOSE_FILE}"
+        fi
+
+        docker-compose -f "${DOCKER_COMPOSE_FILE}" up -d --no-deps "${SERVICE}" && \
+        log "Contenedor ${SERVICE} actualizado correctamente" || \
+        log "ERROR: Fallo al actualizar el contenedor ${SERVICE}"
+
+        echo "$CURRENT_VERSION" > "$VERSION_FILE"
+
+        log "Limpiando imágenes no utilizadas..."
+        docker image prune -af --filter "until=${DOCKER_PRUNE_DAYS}d" || true
+    else
+        log "No hay cambios para ${SERVICE} (Digest: ${ECR_DIGEST})"
+    fi
+done
 
 log "Monitoreo completado"

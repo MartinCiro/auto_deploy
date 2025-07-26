@@ -119,73 +119,106 @@ check_repo() {
 
 build_and_push_docker() {
     local new_version=$(increment_version $(get_current_version))
-    local services=("softcalfut_back" "softcalfut_front") # Lista de servicios a construir
+
+    log_message "Iniciando construcción Docker Compose para versión $new_version..."
+
+    if [ ! -f "$REPO_DIR/docker-compose.yml" ]; then
+        log_message "ERROR: docker-compose.yml no encontrado en $REPO_DIR"
+        return 1
+    fi
+
+    log_message "Limpiando imágenes antiguas..."
+    $DOCKER system prune -af --filter "until=24h" || {
+        log_message "WARNING: No se pudo limpiar completamente"
+    }
+
+    # Establecer las imágenes a manejar
+    declare -a SERVICES=("softcalfut_back" "softcalfut_front")
+    #declare -a SERVICES=("softcalfut_back")
+    declare -A IMAGES
+
+    for service in "${SERVICES[@]}"; do
+        IMAGES[$service]="$ECR_URL/${ID}_$service"
+        log_message "Preparando imagen: ${IMAGES[$service]}"  # Para debug
+    done
+
+
+    touch "$REPO_DIR/.env"
+    sed -i "/^DOCKER_IMAGE_NAME_/d" "$REPO_DIR/.env"
+    sed -i "/^VERSION=/d" "$REPO_DIR/.env"
+
     
-    log_message "Iniciando construcción de imágenes Docker para versión $new_version..."
+    
+    {
+      echo "VERSION=$new_version"
+      for service in "${SERVICES[@]}"; do
+        safe_service=$(echo "$service" | tr '_' '-')
+        echo "DOCKER_IMAGE_NAME_${service^^}=${IMAGES[$service]}"
+      done
+    } >> "$REPO_DIR/.env"
 
-    # Limpiar imágenes antiguas
-    #log_message "Limpiando imágenes antiguas..."
-    #$DOCKER system prune -af --filter "until=24h" || {
-    #    log_message "WARNING: No se pudo limpiar completamente"
-    #}
+    log_message "Ejecutando docker-compose build..."
+    if ! docker-compose -f "$REPO_DIR/docker-compose.yml" --env-file "$REPO_DIR/.env" build; then
+        log_message "docker-compose -f '$REPO_DIR/docker-compose.yml' --env-file '$REPO_DIR/.env' build"
+        log_message "ERROR: Falló la construcción con docker-compose"
+        return 1
+    fi
+    log_message "Construcción exitosa, subiendo imágenes a ECR..."
 
-    # Crear archivo .env para docker-compose
-    echo "VERSION=$new_version" > "$REPO_DIR/.env"
-    echo "DOCKER_IMAGE_NAME=$DOCKER_IMAGE_NAME" >> "$REPO_DIR/.env"
+    # Autenticarse en ECR
+    log_message "Autenticando con ECR..."
+    if ! aws ecr get-login-password --region "$REGION" | \
+        $DOCKER login --username AWS --password-stdin "$ECR_URL"; then
+        log_message "ERROR: Falló autenticación con ECR"
+        return 1
+    fi
 
-    # Construir y subir cada servicio individualmente
-    for service in "${services[@]}"; do
-        local image_name="${DOCKER_IMAGE_NAME}_${service}"
-        local image_version="${image_name}:${new_version}"
-        local image_latest="${image_name}:latest"
+    # Etiquetar y subir cada imagen
+    for service in "${SERVICES[@]}"; do
+        local image_base="${IMAGES[$service]}"
+        local image_version="$image_base:$new_version"
+        local image_latest="$image_base:latest"
 
-        log_message "Construyendo servicio $service..."
-        
-        # Construir el servicio específico
-        if ! docker-compose -f "$REPO_DIR/docker-compose.yml" --env-file "$REPO_DIR/.env" build "$service"; then
-            log_message "ERROR: Falló la construcción del servicio $service"
-            return 1
-        fi
+        log_message "Etiquetando $image_base como $image_version y latest..."
+        $DOCKER tag "$image_base" "$image_version"
+        $DOCKER tag "$image_base" "$image_latest"
 
-        # Verificar si la imagen fue creada
-        if ! $DOCKER image inspect "$image_name" >/dev/null 2>&1; then
-            log_message "ERROR: No se encontró la imagen para el servicio $service"
-            return 1
-        fi
+        # Extraer el nombre del repositorio ECR (ej: proyecto-softcalfut-softcalfut-back)
+        local repo_name=$(echo "$image_base" | awk -F/ '{print $2}')
 
-        # Etiquetar imagen con versión
-        log_message "Etiquetando imágenes para $service..."
-        $DOCKER tag "$image_name" "$image_version"
-        $DOCKER tag "$image_name" "$image_latest"
-
-        # Login a ECR (solo una vez)
-        if [ "$service" == "${services[0]}" ]; then
-            log_message "Autenticando con ECR..."
-            if ! aws ecr get-login-password --region "$REGION" | \
-                $DOCKER login --username AWS --password-stdin "$ECR_URL"; then
-                log_message "ERROR: Falló autenticación con ECR"
+        # Verificar si el repositorio ECR existe, si no, crearlo
+        if ! aws ecr describe-repositories --repository-names "$repo_name" --region "$REGION" &>/dev/null; then
+            log_message "Repositorio ECR '$repo_name' no existe, creándolo..."
+            aws ecr create-repository --repository-name "$repo_name" --region "$REGION" || {
+                log_message "ERROR: No se pudo crear el repositorio ECR '$repo_name'"
                 return 1
-            fi
+            }
+            # Aplicar políticas de retención si es necesario (opcional)
+            aws ecr set-repository-policy \
+                --repository-name "$repo_name" \
+                --policy-text '{"rules":[{"rulePriority":1,"description":"Expirar imágenes antiguas","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":30},"action":{"type":"expire"}}]}' \
+                --region "$REGION"
         fi
 
-        # Subir imágenes
-        log_message "Subiendo imágenes de $service a ECR..."
-        if ! $DOCKER push "$image_version"; then
-            log_message "ERROR: Falló push de versión $new_version para $service"
+        log_message "Pusheando $image_version..."
+        $DOCKER push "$image_version" || {
+            log_message "ERROR: Falló push de $image_version"
             return 1
-        fi
+        }
 
-        if ! $DOCKER push "$image_latest"; then
-            log_message "ERROR: Falló push de imagen latest para $service"
+        log_message "Pusheando $image_latest..."
+        $DOCKER push "$image_latest" || {
+            log_message "ERROR: Falló push de $image_latest"
             return 1
-        fi
+        }
     done
 
     echo "$new_version" > "$VERSION_FILE"
-    log_message "✅ Despliegue exitoso! Todas las imágenes subidas a ECR para versión $new_version"
+    log_message "✅ Despliegue exitoso. Versión $new_version en ECR."
 
     return 0
 }
+
 
 notify_production() {
     # Optional: Add notification to production server

@@ -4,5 +4,5 @@ services:
       context: .
       dockerfile: dockerfile
       args:
-        - VERSION=${VERSION}
+        - VERSION=${DOCKER_IMAGE_VERSION}
     image: ${DOCKER_IMAGE_NAME}
